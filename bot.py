@@ -1,8 +1,8 @@
 """
 Discord Moderation Bot — Powered by Groq AI
-Groq ang mag-aanalyze ng bawat message at magde-decide kung i-moderate.
+Groq analyzes every message and decides if it needs moderation.
 
-ENV VARIABLES (i-set sa Render):
+ENV VARIABLES (set in Render):
   DISCORD_TOKEN   — Discord bot token
   GROQ_API_KEY    — Groq API key (console.groq.com)
 """
@@ -10,6 +10,7 @@ ENV VARIABLES (i-set sa Render):
 import os
 import re
 import time
+import json
 import asyncio
 from collections import defaultdict
 
@@ -20,7 +21,7 @@ from groq import Groq
 from keep_alive import keep_alive
 
 # ─────────────────────────────────────────
-#  ENV VARIABLES — hindi na hardcoded!
+#  ENV VARIABLES
 # ─────────────────────────────────────────
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GROQ_API_KEY  = os.environ["GROQ_API_KEY"]
@@ -28,13 +29,13 @@ GROQ_API_KEY  = os.environ["GROQ_API_KEY"]
 # ─────────────────────────────────────────
 #  SETTINGS
 # ─────────────────────────────────────────
-SPAM_MESSAGE_LIMIT   = 5    # max messages bago ma-mute
-SPAM_TIME_WINDOW     = 5    # seconds
-ANTI_RAID_JOIN_LIMIT = 10   # max joins
-ANTI_RAID_TIME_WINDOW = 10  # seconds
-MUTED_ROLE_NAME      = "Muted"
+SPAM_MESSAGE_LIMIT    = 5    # max messages before mute
+SPAM_TIME_WINDOW      = 5    # seconds
+ANTI_RAID_JOIN_LIMIT  = 10   # max joins
+ANTI_RAID_TIME_WINDOW = 10   # seconds
+MUTED_ROLE_NAME       = "Muted"
 
-# Allowed domains para sa anti-link
+# Allowed domains for anti-link
 ALLOWED_LINKS = ["discord.com", "discord.gg", "youtube.com", "youtu.be"]
 
 # ─────────────────────────────────────────
@@ -56,15 +57,6 @@ raid_tracker = []                  # [join timestamps]
 #  GROQ AI — MODERATION ANALYZER
 # ─────────────────────────────────────────
 async def groq_analyze(message_content: str) -> dict:
-    """
-    Tanungin ang Groq kung dapat i-moderate ang message.
-    Returns: {
-        "should_moderate": bool,
-        "action": "delete" | "warn" | "mute" | "kick" | "ban" | "none",
-        "reason": str,
-        "severity": "low" | "medium" | "high"
-    }
-    """
     prompt = f"""You are a Discord chat moderator AI. Analyze this message and decide if it needs moderation.
 
 Message: "{message_content}"
@@ -82,7 +74,7 @@ Respond ONLY in this exact JSON format, no extra text:
 {{
   "should_moderate": true or false,
   "action": "delete" or "warn" or "mute" or "kick" or "ban" or "none",
-  "reason": "short reason in Filipino or English",
+  "reason": "short reason in English",
   "severity": "low" or "medium" or "high"
 }}
 
@@ -102,16 +94,12 @@ Action guide:
             temperature=0.1,
             max_tokens=150,
         ))
-
-        import json
         text = response.choices[0].message.content.strip()
-        # Strip markdown code blocks kung meron
         text = re.sub(r"```json|```", "", text).strip()
         return json.loads(text)
 
     except Exception as e:
         print(f"[Groq Error] {e}")
-        # Default: huwag mag-moderate pag may error
         return {"should_moderate": False, "action": "none", "reason": "", "severity": "low"}
 
 
@@ -139,7 +127,6 @@ def is_allowed_link(text: str) -> bool:
 #  EXECUTE MOD ACTION
 # ─────────────────────────────────────────
 async def execute_mod_action(message: discord.Message, result: dict):
-    """I-execute ang action na sinesuggest ng Groq."""
     member = message.author
     guild  = message.guild
     action = result.get("action", "none")
@@ -148,7 +135,6 @@ async def execute_mod_action(message: discord.Message, result: dict):
     if action == "none":
         return
 
-    # Always delete the message
     try:
         await message.delete()
     except discord.NotFound:
@@ -156,41 +142,34 @@ async def execute_mod_action(message: discord.Message, result: dict):
 
     severity_emoji = {"low": "🟡", "medium": "🟠", "high": "🔴"}.get(result.get("severity", "low"), "🟡")
 
-    # Warn
     if action in ("warn", "mute", "kick", "ban"):
         warn_data[member.id].append(reason)
         warn_count = len(warn_data[member.id])
-
         await message.channel.send(
-            f"{severity_emoji} {member.mention}, na-flag ang iyong message ng AI Moderator.\n"
-            f"**Dahilan:** {reason}\n"
+            f"{severity_emoji} {member.mention}, your message was flagged by the AI Moderator.\n"
+            f"**Reason:** {reason}\n"
             f"**Warnings:** {warn_count}",
             delete_after=10
         )
 
-    # Mute
     if action == "mute":
         muted_role = await get_or_create_muted_role(guild)
         await member.add_roles(muted_role, reason=f"AI Mod: {reason}")
-        await message.channel.send(
-            f"🔇 {member.mention} ay na-mute ng 10 minuto.", delete_after=10
-        )
+        await message.channel.send(f"🔇 {member.mention} has been muted for 10 minutes.", delete_after=10)
         await asyncio.sleep(600)
         await member.remove_roles(muted_role, reason="AI Mod mute expired")
 
-    # Kick
     elif action == "kick":
         try:
             await member.kick(reason=f"AI Mod: {reason}")
-            await message.channel.send(f"👢 {member} ay na-kick.", delete_after=10)
+            await message.channel.send(f"👢 {member} has been kicked.", delete_after=10)
         except discord.Forbidden:
             pass
 
-    # Ban
     elif action == "ban":
         try:
             await member.ban(reason=f"AI Mod: {reason}")
-            await message.channel.send(f"🔨 {member} ay na-ban.", delete_after=10)
+            await message.channel.send(f"🔨 {member} has been banned.", delete_after=10)
         except discord.Forbidden:
             pass
 
@@ -216,7 +195,7 @@ async def on_member_join(member: discord.Member):
 
     if len(recent) >= ANTI_RAID_JOIN_LIMIT:
         try:
-            await member.kick(reason="⚠️ Anti-Raid: Mabilis na pag-join")
+            await member.kick(reason="⚠️ Anti-Raid: Too many joins in a short time")
         except discord.Forbidden:
             pass
 
@@ -229,16 +208,16 @@ async def on_message(message: discord.Message):
     member  = message.author
     content = message.content
 
-    # ── ANTI-LINK (mabilis, walang AI needed) ──
+    # ── ANTI-LINK ──
     if contains_link(content) and not is_allowed_link(content):
         if not member.guild_permissions.manage_messages:
             await message.delete()
             await message.channel.send(
-                f"🔗 {member.mention}, bawal mag-post ng links dito!", delete_after=5
+                f"🔗 {member.mention}, posting links is not allowed here!", delete_after=5
             )
             return
 
-    # ── SPAM DETECTION (mabilis din) ──
+    # ── SPAM DETECTION ──
     now = time.time()
     spam_tracker[member.id].append(now)
     recent_msgs = [t for t in spam_tracker[member.id] if now - t < SPAM_TIME_WINDOW]
@@ -247,27 +226,26 @@ async def on_message(message: discord.Message):
     if len(recent_msgs) >= SPAM_MESSAGE_LIMIT:
         spam_tracker[member.id].clear()
         muted_role = await get_or_create_muted_role(message.guild)
-        await member.add_roles(muted_role, reason="Auto-mute: Spam")
+        await member.add_roles(muted_role, reason="Auto-mute: Spam detected")
         await message.channel.send(
-            f"🔇 {member.mention} ay na-mute dahil sa spam. (5 minuto)", delete_after=10
+            f"🔇 {member.mention} has been muted for spamming. (5 minutes)", delete_after=10
         )
         await asyncio.sleep(300)
         await member.remove_roles(muted_role, reason="Spam mute expired")
         return
 
     # ── GROQ AI MODERATION ──
-    # Skip kung maikli lang o walang laman ang message
     if len(content.strip()) > 3:
         result = await groq_analyze(content)
         if result.get("should_moderate"):
             await execute_mod_action(message, result)
-            return  # Huwag na i-process bilang command
+            return
 
     await bot.process_commands(message)
 
 
 # ─────────────────────────────────────────
-#  MOD COMMANDS (para sa manual moderation)
+#  MOD COMMANDS
 # ─────────────────────────────────────────
 def is_mod():
     async def predicate(ctx):
@@ -277,19 +255,19 @@ def is_mod():
 
 @bot.command()
 @is_mod()
-async def warn(ctx, member: discord.Member, *, reason: str = "Walang dahilan"):
+async def warn(ctx, member: discord.Member, *, reason: str = "No reason provided"):
     """!warn @user [reason]"""
     warn_data[member.id].append(reason)
     warn_count = len(warn_data[member.id])
-    await ctx.send(f"⚠️ {member.mention} ay na-warn. Total: **{warn_count}**\nDahilan: {reason}")
+    await ctx.send(f"⚠️ {member.mention} has been warned. Total: **{warn_count}**\nReason: {reason}")
 
     if warn_count == 3:
         muted_role = await get_or_create_muted_role(ctx.guild)
-        await member.add_roles(muted_role, reason="3 warnings")
-        await ctx.send(f"🔇 {member.mention} ay na-mute dahil sa 3 warnings.")
+        await member.add_roles(muted_role, reason="3 warnings — auto mute")
+        await ctx.send(f"🔇 {member.mention} has been muted for reaching 3 warnings.")
     elif warn_count >= 5:
-        await member.ban(reason="5+ warnings")
-        await ctx.send(f"🔨 {member.mention} ay na-ban dahil sa {warn_count} warnings.")
+        await member.ban(reason="5+ warnings — auto ban")
+        await ctx.send(f"🔨 {member.mention} has been banned for reaching {warn_count} warnings.")
 
 
 @bot.command()
@@ -298,9 +276,9 @@ async def warnings(ctx, member: discord.Member):
     """!warnings @user"""
     warns = warn_data.get(member.id, [])
     if not warns:
-        return await ctx.send(f"✅ {member.mention} walang warnings.")
+        return await ctx.send(f"✅ {member.mention} has no warnings.")
     warn_list = "\n".join(f"{i+1}. {w}" for i, w in enumerate(warns))
-    await ctx.send(f"⚠️ **Warnings ni {member}** ({len(warns)}):\n{warn_list}")
+    await ctx.send(f"⚠️ **Warnings for {member}** ({len(warns)} total):\n{warn_list}")
 
 
 @bot.command()
@@ -308,16 +286,16 @@ async def warnings(ctx, member: discord.Member):
 async def clearwarns(ctx, member: discord.Member):
     """!clearwarns @user"""
     warn_data[member.id] = []
-    await ctx.send(f"✅ Na-clear ang warnings ni {member.mention}.")
+    await ctx.send(f"✅ All warnings for {member.mention} have been cleared.")
 
 
 @bot.command()
 @is_mod()
-async def mute(ctx, member: discord.Member, duration: int = 10, *, reason: str = "Walang dahilan"):
-    """!mute @user [minuto] [reason]"""
+async def mute(ctx, member: discord.Member, duration: int = 10, *, reason: str = "No reason provided"):
+    """!mute @user [minutes] [reason]"""
     muted_role = await get_or_create_muted_role(ctx.guild)
     await member.add_roles(muted_role, reason=reason)
-    await ctx.send(f"🔇 {member.mention} na-mute ng {duration} minuto.")
+    await ctx.send(f"🔇 {member.mention} has been muted for {duration} minute(s). Reason: {reason}")
     await asyncio.sleep(duration * 60)
     await member.remove_roles(muted_role, reason="Mute expired")
 
@@ -328,23 +306,23 @@ async def unmute(ctx, member: discord.Member):
     """!unmute @user"""
     muted_role = await get_or_create_muted_role(ctx.guild)
     await member.remove_roles(muted_role)
-    await ctx.send(f"🔊 {member.mention} na-unmute na.")
+    await ctx.send(f"🔊 {member.mention} has been unmuted.")
 
 
 @bot.command()
 @is_mod()
-async def kick(ctx, member: discord.Member, *, reason: str = "Walang dahilan"):
+async def kick(ctx, member: discord.Member, *, reason: str = "No reason provided"):
     """!kick @user [reason]"""
     await member.kick(reason=reason)
-    await ctx.send(f"👢 {member} na-kick. Dahilan: {reason}")
+    await ctx.send(f"👢 {member} has been kicked. Reason: {reason}")
 
 
 @bot.command()
 @is_mod()
-async def ban(ctx, member: discord.Member, *, reason: str = "Walang dahilan"):
+async def ban(ctx, member: discord.Member, *, reason: str = "No reason provided"):
     """!ban @user [reason]"""
     await member.ban(reason=reason)
-    await ctx.send(f"🔨 {member} na-ban. Dahilan: {reason}")
+    await ctx.send(f"🔨 {member} has been banned. Reason: {reason}")
 
 
 @bot.command()
@@ -352,7 +330,7 @@ async def ban(ctx, member: discord.Member, *, reason: str = "Walang dahilan"):
 async def purge(ctx, amount: int = 10):
     """!purge [amount]"""
     deleted = await ctx.channel.purge(limit=amount + 1)
-    await ctx.send(f"🗑️ Na-delete ang {len(deleted) - 1} messages.", delete_after=5)
+    await ctx.send(f"🗑️ Deleted {len(deleted) - 1} messages.", delete_after=5)
 
 
 # ─────────────────────────────────────────
@@ -361,11 +339,11 @@ async def purge(ctx, amount: int = 10):
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ Wala kang permission.", delete_after=5)
+        await ctx.send("❌ You don't have permission to use this.", delete_after=5)
     elif isinstance(error, commands.MemberNotFound):
-        await ctx.send("❌ Hindi mahanap ang user.", delete_after=5)
+        await ctx.send("❌ User not found.", delete_after=5)
     elif isinstance(error, commands.CheckFailure):
-        await ctx.send("❌ Mods lang ang pwedeng gumamit nito.", delete_after=5)
+        await ctx.send("❌ Only moderators can use this command.", delete_after=5)
     else:
         print(f"[Error] {error}")
 
@@ -373,5 +351,10 @@ async def on_command_error(ctx, error):
 # ─────────────────────────────────────────
 #  START
 # ─────────────────────────────────────────
-keep_alive()        # Para hindi mag-sleep sa Render
-bot.run(DISCORD_TOKEN)
+keep_alive()
+
+try:
+    bot.run(DISCORD_TOKEN)
+except Exception as e:
+    print(f"❌ BOT CRASH: {e}", flush=True)
+    raise
